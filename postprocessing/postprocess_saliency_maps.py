@@ -5,6 +5,7 @@ import os
 import argparse
 from sklearn.cluster import KMeans
 from tqdm import tqdm
+from laplacian_refinement import laplacian_guided_refine
 
 np.random.seed(10)
 
@@ -130,6 +131,33 @@ def postprocess_kmeans(args):
         segmented_image = cv2.resize(segmented_image, (w,h),interpolation=cv2.INTER_NEAREST)
         segmented_image = segmented_image.astype(np.uint8)*255
 
+        # ====== LG-SR REFINEMENT ======
+        if args.use_lg_sr:
+            # Load original image for Laplacian computation
+            original_image = cv2.imread(os.path.join(args.input_path, file), 1)
+            
+            if original_image is not None:
+                try:
+                    # Apply Laplacian-Guided Saliency Refinement
+                    segmented_image = laplacian_guided_refine(
+                        segmented_image,
+                        original_image,
+                        alpha=args.lg_sr_alpha,
+                        edge_threshold=args.lg_sr_edge_threshold,
+                        use_watershed=args.lg_sr_use_watershed
+                    )
+                    
+                    if args.verbose:
+                        print(f"  {file}: LG-SR applied successfully")
+                        
+                except Exception as e:
+                    print(f"  Warning: LG-SR failed for {file}: {str(e)}")
+                    # Continue with original segmented_image
+            else:
+                if args.verbose:
+                    print(f"  Warning: Could not load original image for {file}")
+        # ================================
+
         nb_blobs, im_with_separated_blobs, stats, _ = cv2.connectedComponentsWithStats(segmented_image)
         sizes = stats[:, cv2.CC_STAT_AREA]
         
@@ -180,6 +208,20 @@ def get_parser():
     parser.add_argument('--min-size', type=int, default=100,
                         help="Minimum size of clusters to keep")
     parser.add_argument('--num-contours', type=int, default=1, help="Number of contours to keep")
+    
+    # ====== LG-SR (Laplacian-Guided Saliency Refinement) Arguments ======
+    parser.add_argument('--use-lg-sr', action='store_true',
+                        help="Enable Laplacian-Guided Saliency Refinement (default: disabled)")
+    parser.add_argument('--lg-sr-alpha', type=float, default=0.5,
+                        help="Fusion gain factor for LG-SR. Higher = more edge reinforcement (default 0.5)")
+    parser.add_argument('--lg-sr-edge-threshold', type=float, default=0.1,
+                        help="Threshold for determining weak edges in LG-SR. "
+                             "If mean edge strength < threshold, use fallback (default 0.1)")
+    parser.add_argument('--lg-sr-use-watershed', action='store_true', default=False,
+                        help="Use watershed fallback instead of morphological (default: False, use morphological)")
+    parser.add_argument('--verbose', action='store_true',
+                        help="Print verbose debug information for LG-SR")
+    # ====================================================================
 
     return parser.parse_args()
 if __name__ == '__main__':
