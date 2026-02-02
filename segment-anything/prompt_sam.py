@@ -58,7 +58,7 @@ parser.add_argument(
     "--prompts",
     type=str,
     required=True,
-    help="The type of prompts to use, in ['points', 'boxes', 'both', 'box_center']",
+    help="The type of prompts to use, in ['points', 'boxes', 'both']",
 )
 
 parser.add_argument(
@@ -189,42 +189,6 @@ def get_prompts(mask, args):
         if(args.prompts == "boxes"):
             bounding_boxes = np.array(bounding_boxes)
             return np.zeros_like(bounding_boxes), np.zeros_like(bounding_boxes), bounding_boxes, num_contours
-        
-        # New mode: box_center - bounding box + center point + background points
-        if(args.prompts == "box_center"):
-            # Compute center of mass (centroid) from the mask
-            y_coords, x_coords = np.where(mask > 0)
-            if len(y_coords) > 0:
-                center_y = int(np.mean(y_coords))
-                center_x = int(np.mean(x_coords))
-                center_point = np.array([[center_x, center_y]])  # Note: x,y order for SAM
-                
-                # Add a few background points (4 corners outside the main blob)
-                h, w = mask.shape
-                bg_points = []
-                bg_margin = 20  # pixels from edge
-                
-                # Sample background points from regions where mask == 0
-                candidate_bg = np.argwhere(mask.transpose(1,0) == 0)
-                if len(candidate_bg) >= 4:
-                    bg_indices = np.random.choice(len(candidate_bg), min(4, len(candidate_bg)), replace=False)
-                    bg_points = candidate_bg[bg_indices]
-                
-                if len(bg_points) > 0:
-                    all_random_points = np.concatenate([center_point, bg_points])
-                    all_input_labels = [1] + [0] * len(bg_points)  # 1 for center, 0 for background
-                else:
-                    all_random_points = center_point
-                    all_input_labels = [1]
-            else:
-                # Fallback: no foreground pixels, return dummy points
-                all_random_points = np.array([[w//2, h//2]])
-                all_input_labels = [1]
-            
-            all_random_points = np.array(all_random_points)
-            all_input_labels = np.array(all_input_labels)
-            bounding_boxes = np.array(bounding_boxes)
-            return all_random_points, all_input_labels, bounding_boxes, num_contours
     
         pos_num_points = args.num_points  # number of positive random points to get per contour
         neg_num_points = args.neg_num_points  # number of negative random points to get per contour
@@ -265,7 +229,7 @@ def get_final_mask(predictor,all_random_points, all_input_labels,
 
     predictor.set_image(image)
 
-    if(args.prompts == "both" or args.prompts == "box_center"):
+    if(args.prompts == "both"):
         transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, image.shape[:2]) 
         transformed_points = predictor.transform.apply_coords_torch(input_points, image.shape[:2]) 
         masks, scores, _ = predictor.predict_torch(

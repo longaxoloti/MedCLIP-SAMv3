@@ -263,7 +263,6 @@ def laplacian_guided_refine(binary_mask, original_image, alpha=0.5,
     Returns:
         refined_mask: Refined binary mask (uint8: 0-255)
     """
-    # Validate inputs
     if binary_mask is None or original_image is None:
         warnings.warn("Invalid inputs. Returning original mask.")
         if binary_mask is not None:
@@ -272,7 +271,6 @@ def laplacian_guided_refine(binary_mask, original_image, alpha=0.5,
             return None
     
     try:
-        # Convert binary_mask to float [0, 1] for processing
         if binary_mask.dtype == np.uint8:
             mask_float = binary_mask.astype(np.float32) / 255.0
         else:
@@ -286,7 +284,6 @@ def laplacian_guided_refine(binary_mask, original_image, alpha=0.5,
         
         # Step 3: Apply appropriate refinement strategy
         if is_weak_edge:
-            # Edge detection too weak: use fallback methods
             warnings.warn(f"Weak edge detection (strength={edge_strength:.4f}). "
                          f"Using {'watershed' if use_watershed else 'morphological'} fallback.")
             
@@ -296,10 +293,7 @@ def laplacian_guided_refine(binary_mask, original_image, alpha=0.5,
             else:
                 refined_uint8 = morphological_fallback(mask_float, iterations=2, method='close')
         else:
-            # Edges are strong: apply Laplacian-guided fusion
             S_refined = adaptive_fusion(mask_float, edge_map, alpha=alpha)
-            
-            # Convert refined saliency to binary via thresholding
             refined_uint8 = extract_contours_from_refined(S_refined)
         
         # Step 4: Final light morphological cleanup for smoothing

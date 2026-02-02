@@ -110,53 +110,84 @@ def postprocess_kmeans(args):
 
     for file in tqdm(files):
 
-        kmeans = KMeans(n_clusters=2,random_state=10)
-        attn_weights = cv2.imread(args.sal_path+'/'+file, 0) / 255
+        attn_weights = cv2.imread(args.sal_path+'/'+file, 0) / 255.0
         h, w = attn_weights.shape
-        image = cv2.resize(attn_weights, (256, 256),interpolation=cv2.INTER_NEAREST)
-        flat_image = image.reshape(-1, 1)
-
-        labels = kmeans.fit_predict(flat_image)
-
-        segmented_image = labels.reshape(256, 256)
-
-        centroids = kmeans.cluster_centers_.flatten()
-
-        # Identify the background cluster (assuming it has the lowest centroid value)
-        background_cluster = np.argmin(centroids)
-
-        # Mark background pixels as 0 and foreground pixels as 1
-        segmented_image = np.where(segmented_image == background_cluster, 0, 1)
-
-        segmented_image = cv2.resize(segmented_image, (w,h),interpolation=cv2.INTER_NEAREST)
-        segmented_image = segmented_image.astype(np.uint8)*255
-
-        # ====== LG-SR REFINEMENT ======
+        
+        # ====== STEP 1: LOAD AND REFINE SALIENCY MAP ======
         if args.use_lg_sr:
-            # Load original image for Laplacian computation
             original_image = cv2.imread(os.path.join(args.input_path, file), 1)
             
             if original_image is not None:
                 try:
-                    # Apply Laplacian-Guided Saliency Refinement
-                    segmented_image = laplacian_guided_refine(
-                        segmented_image,
+                    # Convert saliency map to 0-255 range for LG-SR processing
+                    attn_weights_uint8 = (attn_weights * 255).astype(np.uint8)
+                    
+                    # Apply Laplacian-Guided Saliency Refinement on original saliency map
+                    refined_saliency = laplacian_guided_refine(
+                        attn_weights_uint8,
                         original_image,
                         alpha=args.lg_sr_alpha,
                         edge_threshold=args.lg_sr_edge_threshold,
                         use_watershed=args.lg_sr_use_watershed
                     )
                     
+                    # Convert back to 0-1 range
+                    attn_weights = refined_saliency.astype(np.float32) / 255.0
+                    
                     if args.verbose:
-                        print(f"  {file}: LG-SR applied successfully")
+                        print(f"  {file}: LG-SR applied to saliency map")
                         
                 except Exception as e:
-                    print(f"  Warning: LG-SR failed for {file}: {str(e)}")
-                    # Continue with original segmented_image
-            else:
-                if args.verbose:
-                    print(f"  Warning: Could not load original image for {file}")
-        # ================================
+                    if args.verbose:
+                        print(f"  Warning: LG-SR failed for {file}: {str(e)}")
+                    # Continue with original attn_weights
+        # ================================================
+        
+        # STEP 2: THRESHOLDING - OTSU or K-MEANS
+        if args.use_otsu:
+            # Use Otsu automatic thresholding
+            attn_weights_uint8 = (attn_weights * 255).astype(np.uint8)
+            threshold_value, segmented_image = cv2.threshold(
+                attn_weights_uint8, 0, 255, 
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            if args.verbose:
+                print(f"  {file}: Otsu threshold = {threshold_value}")
+        else:
+            # Use K-means clustering (original method)
+            kmeans = KMeans(n_clusters=2, random_state=10)
+            image = cv2.resize(attn_weights, (256, 256), interpolation=cv2.INTER_NEAREST)
+            flat_image = image.reshape(-1, 1)
+
+            labels = kmeans.fit_predict(flat_image)
+
+            segmented_image = labels.reshape(256, 256)
+
+            centroids = kmeans.cluster_centers_.flatten()
+
+            # Identify the background cluster (assuming it has the lowest centroid value)
+            background_cluster = np.argmin(centroids)
+
+            # Mark background pixels as 0 and foreground pixels as 1
+            segmented_image = np.where(segmented_image == background_cluster, 0, 1)
+
+            segmented_image = cv2.resize(segmented_image, (w, h), interpolation=cv2.INTER_NEAREST)
+            segmented_image = segmented_image.astype(np.uint8) * 255
+
+        # STEP 3: MORPHOLOGICAL REFINEMENT (Optional)
+        if args.use_morph_refine:
+            # Define kernel size based on image size
+            kernel_size = max(3, min(7, int(min(h, w) * 0.01)))  # Adaptive kernel size
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            
+            # Erosion: Remove small noise blobs and thin boundaries
+            eroded = cv2.erode(segmented_image, kernel, iterations=args.morph_erode_iters)
+            
+            # Dilation: Recover the main region size
+            segmented_image = cv2.dilate(eroded, kernel, iterations=args.morph_dilate_iters)
+            
+            if args.verbose:
+                print(f"  {file}: Morphological refinement (kernel={kernel_size}, erode={args.morph_erode_iters}, dilate={args.morph_dilate_iters})")
 
         nb_blobs, im_with_separated_blobs, stats, _ = cv2.connectedComponentsWithStats(segmented_image)
         sizes = stats[:, cv2.CC_STAT_AREA]
@@ -220,8 +251,22 @@ def get_parser():
     parser.add_argument('--lg-sr-use-watershed', action='store_true', default=False,
                         help="Use watershed fallback instead of morphological (default: False, use morphological)")
     parser.add_argument('--verbose', action='store_true',
-                        help="Print verbose debug information for LG-SR")
+                        help="Print verbose debug information")
     # ====================================================================
+    
+    # ====== Thresholding Options ======
+    parser.add_argument('--use-otsu', action='store_true',
+                        help="Use Otsu automatic thresholding instead of K-means (default: False, use K-means)")
+    # ===================================
+    
+    # ====== Morphological Refinement Options ======
+    parser.add_argument('--use-morph-refine', action='store_true',
+                        help="Apply morphological refinement (erosion + dilation) after thresholding (default: False)")
+    parser.add_argument('--morph-erode-iters', type=int, default=1,
+                        help="Number of erosion iterations to remove noise (default: 1)")
+    parser.add_argument('--morph-dilate-iters', type=int, default=1,
+                        help="Number of dilation iterations to recover size (default: 1)")
+    # ==============================================
 
     return parser.parse_args()
 if __name__ == '__main__':
