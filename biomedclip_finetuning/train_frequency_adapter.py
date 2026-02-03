@@ -38,6 +38,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
 import logging
+from torch.nn.utils.rnn import pad_sequence
 
 # Add paths
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -230,33 +231,54 @@ class MedicalImageTextDataset(Dataset):
         else:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Process image
-        if self.processor is not None:
-            image_tensor = self.processor(image, return_tensors='pt')['pixel_values'].squeeze(0)
-        else:
-            # Fallback: simple normalization
-            image = cv2.resize(image, (self.image_size, self.image_size))
-            image = image.astype(np.float32) / 255.0
-            image = torch.from_numpy(image).permute(2, 0, 1)
-            # ImageNet normalization
-            image = (image - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / \
-                    torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            image_tensor = image
-        
         # Select random text prompt
         text = np.random.choice(self.text_prompts)
         
-        # Tokenize text
-        if self.tokenizer is not None:
-            text_tokens = self.tokenizer([text], return_tensors='pt', padding=True)
-            text_tensor = text_tokens['input_ids'].squeeze(0)
+        # Process image + text jointly when possible
+        if self.processor is not None:
+            try:
+                processed = self.processor(images=image, text=text, return_tensors='pt')
+                image_tensor = processed['pixel_values'].squeeze(0)
+                text_tokens = {
+                    k: v.squeeze(0) for k, v in processed.items()
+                    if k in ['input_ids', 'attention_mask', 'token_type_ids']
+                }
+            except Exception:
+                # Fallback: process image and text separately
+                image_resized = cv2.resize(image, (self.image_size, self.image_size))
+                image_resized = image_resized.astype(np.float32) / 255.0
+                image_t = torch.from_numpy(image_resized).permute(2, 0, 1)
+                image_tensor = (image_t - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / \
+                               torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                
+                if self.tokenizer is not None:
+                    text_tokens = self.tokenizer([text], return_tensors='pt', padding=True)
+                    text_tokens = {k: v.squeeze(0) for k, v in text_tokens.items()}
+                else:
+                    text_tokens = {
+                        'input_ids': torch.zeros(1).long(),
+                        'attention_mask': torch.ones(1).long()
+                    }
         else:
-            # Simple tokenization fallback (should not be used in practice)
-            text_tensor = torch.zeros(1).long()
+            # Fallback: manual processing
+            image = cv2.resize(image, (self.image_size, self.image_size))
+            image = image.astype(np.float32) / 255.0
+            image = torch.from_numpy(image).permute(2, 0, 1)
+            image_tensor = (image - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / \
+                           torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            
+            if self.tokenizer is not None:
+                text_tokens = self.tokenizer([text], return_tensors='pt', padding=True)
+                text_tokens = {k: v.squeeze(0) for k, v in text_tokens.items()}
+            else:
+                text_tokens = {
+                    'input_ids': torch.zeros(1).long(),
+                    'attention_mask': torch.ones(1).long()
+                }
         
         return {
             'image': image_tensor,
-            'text': text_tensor,
+            'text': text_tokens,
             'text_str': text,
             'image_name': img_file,
         }
@@ -320,20 +342,25 @@ class MedpixDataset(Dataset):
         else:  # val
             df = df.iloc[val_indices].reset_index(drop=True)
         
-        # Store data
+        # Store data (ensure caption is string)
+        df['Caption'] = df['Caption'].fillna('').astype(str)
         self.captions = df['Caption'].tolist()
         self.filenames = df['filename'].tolist()
         
         # Filter valid samples (files that exist)
         valid_samples = []
         for caption, filename in zip(self.captions, self.filenames):
-            # Normalize path: remove 'data/medpix_dataset/' prefix if present
-            if filename.startswith('data/medpix_dataset/'):
-                filename = filename.replace('data/medpix_dataset/', '', 1)
+            caption = str(caption).strip()
+            if not caption:
+                continue
+            # Extract just the filename (last part after /)
+            # CSV contains full paths like: data/medpix_dataset/images/synpic100377.jpg
+            # We only need: synpic100377.jpg
+            just_filename = Path(filename).name
             
-            img_path = self.images_root / filename
+            img_path = self.images_root / just_filename
             if img_path.exists():
-                valid_samples.append((caption, filename))
+                valid_samples.append((caption, just_filename))
         
         if max_samples:
             valid_samples = valid_samples[:max_samples]
@@ -360,7 +387,9 @@ class MedpixDataset(Dataset):
         Returns:
             Dictionary with 'image' and 'text' tensors
         """
-        caption = self.captions[idx]
+        caption = str(self.captions[idx]).strip()
+        if not caption:
+            caption = " "
         filename = self.filenames[idx]
         
         # Build image path
@@ -379,30 +408,51 @@ class MedpixDataset(Dataset):
         else:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Process image
+        # Process image + text jointly when possible
         if self.processor is not None:
-            image_tensor = self.processor(image, return_tensors='pt')['pixel_values'].squeeze(0)
+            try:
+                processed = self.processor(images=image, text=caption, return_tensors='pt')
+                image_tensor = processed['pixel_values'].squeeze(0)
+                text_tokens = {
+                    k: v.squeeze(0) for k, v in processed.items()
+                    if k in ['input_ids', 'attention_mask', 'token_type_ids']
+                }
+            except Exception:
+                # Fallback: process image and text separately
+                image_resized = cv2.resize(image, (224, 224))
+                image_resized = image_resized.astype(np.float32) / 255.0
+                image_t = torch.from_numpy(image_resized).permute(2, 0, 1)
+                image_tensor = (image_t - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / \
+                               torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                
+                if self.tokenizer is not None:
+                    text_tokens = self.tokenizer([caption], return_tensors='pt', padding=True)
+                    text_tokens = {k: v.squeeze(0) for k, v in text_tokens.items()}
+                else:
+                    text_tokens = {
+                        'input_ids': torch.zeros(1).long(),
+                        'attention_mask': torch.ones(1).long()
+                    }
         else:
-            # Fallback: simple normalization
+            # Fallback: manual processing
             image = cv2.resize(image, (224, 224))
             image = image.astype(np.float32) / 255.0
             image = torch.from_numpy(image).permute(2, 0, 1)
-            # ImageNet normalization
-            image = (image - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / \
-                    torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            image_tensor = image
-        
-        # Tokenize text
-        if self.tokenizer is not None:
-            text_tokens = self.tokenizer([caption], return_tensors='pt', padding=True)
-            text_tensor = text_tokens['input_ids'].squeeze(0)
-        else:
-            # Simple tokenization fallback
-            text_tensor = torch.zeros(1).long()
+            image_tensor = (image - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / \
+                           torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            
+            if self.tokenizer is not None:
+                text_tokens = self.tokenizer([caption], return_tensors='pt', padding=True)
+                text_tokens = {k: v.squeeze(0) for k, v in text_tokens.items()}
+            else:
+                text_tokens = {
+                    'input_ids': torch.zeros(1).long(),
+                    'attention_mask': torch.ones(1).long()
+                }
         
         return {
             'image': image_tensor,
-            'text': text_tensor,
+            'text': text_tokens,
             'text_str': caption,
             'image_name': filename,
         }
@@ -575,6 +625,19 @@ class FrequencyAdapterTrainer:
         loss_t2i = F.cross_entropy(logits.t(), labels)
         
         return (loss_i2t + loss_t2i) / 2
+
+    @staticmethod
+    def _get_pooled_output(model_outputs):
+        """Extract pooled output from transformer outputs (tuple or object)."""
+        if hasattr(model_outputs, 'pooler_output') and model_outputs.pooler_output is not None:
+            return model_outputs.pooler_output
+        if isinstance(model_outputs, tuple) and len(model_outputs) > 1:
+            return model_outputs[1]
+        if hasattr(model_outputs, 'last_hidden_state'):
+            return model_outputs.last_hidden_state[:, 0]
+        if isinstance(model_outputs, tuple) and len(model_outputs) > 0:
+            return model_outputs[0][:, 0]
+        raise ValueError("Cannot extract pooled output from model outputs")
     
     def train_epoch(self, train_loader: DataLoader) -> Dict:
         """
@@ -608,14 +671,12 @@ class FrequencyAdapterTrainer:
                 text_tokens = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                               for k, v in text_tokens.items()}
             
-            # Forward pass
-            with torch.no_grad():
-                image_outputs = self.model.vision_model(images)
-                image_features = image_outputs.pooler_output
-                
-            with torch.no_grad():
-                text_outputs = self.model.text_model(**text_tokens)
-                text_features = text_outputs.pooler_output
+            # Forward pass (enable gradients for adapter training)
+            image_outputs = self.model.vision_model(images)
+            image_features = self._get_pooled_output(image_outputs)
+            
+            text_outputs = self.model.text_model(**text_tokens)
+            text_features = self._get_pooled_output(text_outputs)
             
             # Compute loss
             batch_size = images.size(0)
@@ -675,10 +736,10 @@ class FrequencyAdapterTrainer:
             
             # Forward pass
             image_outputs = self.model.vision_model(images)
-            image_features = image_outputs.pooler_output
+            image_features = self._get_pooled_output(image_outputs)
             
             text_outputs = self.model.text_model(**text_tokens)
-            text_features = text_outputs.pooler_output
+            text_features = self._get_pooled_output(text_outputs)
             
             # Compute loss
             batch_size = images.size(0)
@@ -767,11 +828,21 @@ class FrequencyAdapterTrainer:
         # Load datasets
         if use_medpix:
             # Use MedPix dataset (caption-based, no segmentation)
-            csv_path = Path(dataset_root).parent / 'medpix_dataset' / 'medpix_dataset.csv'
-            images_root = Path(dataset_root).parent / 'medpix_dataset' / 'images'
+            # MedPix dataset is in same directory level as other datasets (data/medpix_dataset/)
+            csv_path = Path(dataset_root) / 'medpix_dataset' / 'medpix_dataset.csv'
+            images_root = Path(dataset_root) / 'medpix_dataset' / 'images'
             
             self.logger.info(f"Using MedPix CSV: {csv_path}")
             self.logger.info(f"Using MedPix images: {images_root}")
+            
+            # Check if paths exist
+            if not csv_path.exists():
+                self.logger.error(f"CSV not found at: {csv_path}")
+                self.logger.error(f"Dataset root: {dataset_root}")
+                raise FileNotFoundError(f"CSV not found: {csv_path}")
+            if not images_root.exists():
+                self.logger.error(f"Images directory not found at: {images_root}")
+                raise FileNotFoundError(f"Images directory not found: {images_root}")
             
             train_dataset = MedpixDataset(
                 csv_path=str(csv_path),
@@ -813,6 +884,37 @@ class FrequencyAdapterTrainer:
                 tokenizer=self.tokenizer,
                 max_samples=max_val_samples
             )
+
+        def collate_batch(batch: List[Dict]) -> Dict:
+            """Custom collate to pad variable-length text tokens."""
+            images = torch.stack([item['image'] for item in batch], dim=0)
+            text_dicts = [item['text'] for item in batch]
+
+            if isinstance(text_dicts[0], dict):
+                input_ids = [td['input_ids'] for td in text_dicts]
+                attention_mask = [td['attention_mask'] for td in text_dicts]
+
+                padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+                padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+                text_tokens = {
+                    'input_ids': padded_input_ids,
+                    'attention_mask': padded_attention_mask
+                }
+
+                if 'token_type_ids' in text_dicts[0]:
+                    token_type_ids = [td.get('token_type_ids', torch.zeros_like(td['input_ids'])) for td in text_dicts]
+                    padded_token_type_ids = pad_sequence(token_type_ids, batch_first=True, padding_value=0)
+                    text_tokens['token_type_ids'] = padded_token_type_ids
+            else:
+                text_tokens = torch.stack(text_dicts, dim=0)
+
+            return {
+                'image': images,
+                'text': text_tokens,
+                'text_str': [item['text_str'] for item in batch],
+                'image_name': [item['image_name'] for item in batch],
+            }
         
         # Create dataloaders
         train_loader = DataLoader(
@@ -820,7 +922,8 @@ class FrequencyAdapterTrainer:
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_batch
         )
         
         val_loader = DataLoader(
@@ -828,7 +931,8 @@ class FrequencyAdapterTrainer:
             batch_size=val_batch_size,
             shuffle=False,
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_batch
         )
         
         # Setup scheduler
