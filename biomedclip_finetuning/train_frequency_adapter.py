@@ -262,6 +262,152 @@ class MedicalImageTextDataset(Dataset):
         }
 
 
+class MedpixDataset(Dataset):
+    """Dataset for MedPix caption-based training (no segmentation masks)."""
+    
+    def __init__(
+        self,
+        csv_path: str,
+        images_root: str,
+        split: str = 'train',
+        split_ratio: float = 0.85,
+        seed: int = 42,
+        processor = None,
+        tokenizer = None,
+        max_samples: Optional[int] = None
+    ):
+        """
+        Initialize MedPix dataset with 85/15 train/val split.
+        
+        Args:
+            csv_path: Path to medpix_dataset.csv
+            images_root: Root directory for images
+            split: Data split ('train' or 'val')
+            split_ratio: Ratio for train/val split (default: 0.85)
+            seed: Random seed for reproducibility
+            processor: Image processor for preprocessing
+            tokenizer: Text tokenizer
+            max_samples: Maximum number of samples to load
+        """
+        self.csv_path = Path(csv_path)
+        self.images_root = Path(images_root)
+        self.split = split
+        self.processor = processor
+        self.tokenizer = tokenizer
+        
+        if not self.csv_path.exists():
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
+        if not self.images_root.exists():
+            raise FileNotFoundError(f"Images root not found: {images_root}")
+        
+        # Load CSV
+        import pandas as pd
+        df = pd.read_csv(self.csv_path)
+        
+        # Set random seed for reproducibility
+        np.random.seed(seed)
+        
+        # Split data: 85% train, 15% val
+        n_total = len(df)
+        n_train = int(n_total * split_ratio)
+        
+        indices = np.random.permutation(n_total)
+        train_indices = indices[:n_train]
+        val_indices = indices[n_train:]
+        
+        if split == 'train':
+            df = df.iloc[train_indices].reset_index(drop=True)
+        else:  # val
+            df = df.iloc[val_indices].reset_index(drop=True)
+        
+        # Store data
+        self.captions = df['Caption'].tolist()
+        self.filenames = df['filename'].tolist()
+        
+        # Filter valid samples (files that exist)
+        valid_samples = []
+        for caption, filename in zip(self.captions, self.filenames):
+            # Normalize path: remove 'data/medpix_dataset/' prefix if present
+            if filename.startswith('data/medpix_dataset/'):
+                filename = filename.replace('data/medpix_dataset/', '', 1)
+            
+            img_path = self.images_root / filename
+            if img_path.exists():
+                valid_samples.append((caption, filename))
+        
+        if max_samples:
+            valid_samples = valid_samples[:max_samples]
+        
+        if not valid_samples:
+            raise ValueError(f"No valid samples found for {split} split")
+        
+        self.captions = [s[0] for s in valid_samples]
+        self.filenames = [s[1] for s in valid_samples]
+        
+        print(f"✓ Loaded {len(self.captions)} {split} samples from MedPix")
+    
+    def __len__(self) -> int:
+        """Get dataset size."""
+        return len(self.captions)
+    
+    def __getitem__(self, idx: int) -> Dict:
+        """
+        Get a sample.
+        
+        Args:
+            idx: Index of sample
+            
+        Returns:
+            Dictionary with 'image' and 'text' tensors
+        """
+        caption = self.captions[idx]
+        filename = self.filenames[idx]
+        
+        # Build image path
+        img_path = self.images_root / filename
+        
+        # Load image
+        image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert grayscale to RGB (BiomedCLIP expects 3 channels)
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[2] != 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Process image
+        if self.processor is not None:
+            image_tensor = self.processor(image, return_tensors='pt')['pixel_values'].squeeze(0)
+        else:
+            # Fallback: simple normalization
+            image = cv2.resize(image, (224, 224))
+            image = image.astype(np.float32) / 255.0
+            image = torch.from_numpy(image).permute(2, 0, 1)
+            # ImageNet normalization
+            image = (image - torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)) / \
+                    torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            image_tensor = image
+        
+        # Tokenize text
+        if self.tokenizer is not None:
+            text_tokens = self.tokenizer([caption], return_tensors='pt', padding=True)
+            text_tensor = text_tokens['input_ids'].squeeze(0)
+        else:
+            # Simple tokenization fallback
+            text_tensor = torch.zeros(1).long()
+        
+        return {
+            'image': image_tensor,
+            'text': text_tensor,
+            'text_str': caption,
+            'image_name': filename,
+        }
+
+
 class FrequencyAdapterTrainer:
     """Trainer for frequency adapters on BiomedCLIP."""
     
@@ -589,6 +735,7 @@ class FrequencyAdapterTrainer:
         num_workers: int = 4,
         max_train_samples: Optional[int] = None,
         max_val_samples: Optional[int] = None,
+        use_medpix: bool = True,
     ):
         """
         Train frequency adapters.
@@ -601,12 +748,16 @@ class FrequencyAdapterTrainer:
             num_workers: Number of data loading workers
             max_train_samples: Maximum training samples (for debugging)
             max_val_samples: Maximum validation samples (for debugging)
+            use_medpix: Whether to use MedPix dataset (True) or medical segmentation datasets (False)
         """
         if val_batch_size is None:
             val_batch_size = batch_size
         
         self.logger.info("="*60)
-        self.logger.info(f"Training on {self.dataset_name}")
+        if use_medpix:
+            self.logger.info("Training on MedPix dataset (85/15 split)")
+        else:
+            self.logger.info(f"Training on {self.dataset_name}")
         self.logger.info("="*60)
         self.logger.info(f"Epochs: {num_epochs}")
         self.logger.info(f"Batch size: {batch_size}")
@@ -614,23 +765,54 @@ class FrequencyAdapterTrainer:
         self.logger.info("="*60)
         
         # Load datasets
-        train_dataset = MedicalImageTextDataset(
-            dataset_root,
-            self.dataset_name,
-            split='train',
-            processor=self.processor,
-            tokenizer=self.tokenizer,
-            max_samples=max_train_samples
-        )
-        
-        val_dataset = MedicalImageTextDataset(
-            dataset_root,
-            self.dataset_name,
-            split='val',
-            processor=self.processor,
-            tokenizer=self.tokenizer,
-            max_samples=max_val_samples
-        )
+        if use_medpix:
+            # Use MedPix dataset (caption-based, no segmentation)
+            csv_path = Path(dataset_root).parent / 'medpix_dataset' / 'medpix_dataset.csv'
+            images_root = Path(dataset_root).parent / 'medpix_dataset' / 'images'
+            
+            self.logger.info(f"Using MedPix CSV: {csv_path}")
+            self.logger.info(f"Using MedPix images: {images_root}")
+            
+            train_dataset = MedpixDataset(
+                csv_path=str(csv_path),
+                images_root=str(images_root),
+                split='train',
+                split_ratio=0.85,
+                seed=42,
+                processor=self.processor,
+                tokenizer=self.tokenizer,
+                max_samples=max_train_samples
+            )
+            
+            val_dataset = MedpixDataset(
+                csv_path=str(csv_path),
+                images_root=str(images_root),
+                split='val',
+                split_ratio=0.85,
+                seed=42,
+                processor=self.processor,
+                tokenizer=self.tokenizer,
+                max_samples=max_val_samples
+            )
+        else:
+            # Use medical segmentation datasets
+            train_dataset = MedicalImageTextDataset(
+                dataset_root,
+                self.dataset_name,
+                split='train',
+                processor=self.processor,
+                tokenizer=self.tokenizer,
+                max_samples=max_train_samples
+            )
+            
+            val_dataset = MedicalImageTextDataset(
+                dataset_root,
+                self.dataset_name,
+                split='val',
+                processor=self.processor,
+                tokenizer=self.tokenizer,
+                max_samples=max_val_samples
+            )
         
         # Create dataloaders
         train_loader = DataLoader(
@@ -812,12 +994,27 @@ def main():
         default=None,
         help='Max validation samples (for debugging)'
     )
+    parser.add_argument(
+        '--use-medpix',
+        action='store_true',
+        default=True,
+        help='Use MedPix dataset (default: True). Use --no-medpix to use medical segmentation datasets'
+    )
+    parser.add_argument(
+        '--no-medpix',
+        dest='use_medpix',
+        action='store_false',
+        help='Use medical segmentation datasets instead of MedPix'
+    )
     
     args = parser.parse_args()
     
     # Create timestamp for output directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_dir = os.path.join(args.output_dir, args.dataset, timestamp)
+    if args.use_medpix:
+        output_dir = os.path.join(args.output_dir, 'medpix', timestamp)
+    else:
+        output_dir = os.path.join(args.output_dir, args.dataset, timestamp)
     
     # Create trainer
     trainer = FrequencyAdapterTrainer(
@@ -840,6 +1037,7 @@ def main():
         num_workers=args.num_workers,
         max_train_samples=args.max_train_samples,
         max_val_samples=args.max_val_samples,
+        use_medpix=args.use_medpix,
     )
 
 

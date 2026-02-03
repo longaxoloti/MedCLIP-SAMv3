@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Baseline Evaluation Script for BiomedCLIP (without frequency adapters)
+Semantic Sanity Check for BiomedCLIP
 
-This script evaluates the pre-trained BiomedCLIP model on the 4 medical imaging datasets
-(brain_tumors, breast_tumors, lung_CT, lung_Xray) without any fine-tuning.
+This script validates that BiomedCLIP can be loaded and performs image-text encoding.
+It computes semantic similarity between images and text prompts for diagnostic purposes.
 
 Usage:
     python evaluate_baseline.py --dataset-root /path/to/data --output-dir ./results
@@ -30,12 +30,6 @@ from typing import Dict, List, Tuple, Optional
 # Add paths
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-try:
-    from evaluation.SurfaceDice import compute_surface_distances, compute_surface_dice_at_tolerance, compute_dice_coefficient
-except ImportError:
-    print("Warning: Could not import SurfaceDice, installing would be required for NSD metric")
-    compute_dice_coefficient = None
 
 
 class BiomedCLIPBaseline:
@@ -131,13 +125,37 @@ class BiomedCLIPBaseline:
 
 
 class DatasetEvaluator:
-    """Evaluator for medical imaging datasets."""
+    """Semantic evaluator for medical imaging datasets (sanity check only)."""
     
     DATASETS = {
         'brain_tumors': 'Brain Tumor',
         'breast_tumors': 'Breast Tumor',
         'lung_CT': 'Lung CT',
         'lung_Xray': 'Lung X-Ray'
+    }
+    
+    # Default text prompts for semantic evaluation
+    PROMPTS = {
+        'brain_tumors': [
+            "A medical brain MRI scan showing a tumor.",
+            "Brain tumor visible in the imaging.",
+            "Abnormal brain tissue mass in MRI.",
+        ],
+        'breast_tumors': [
+            "A medical breast mammogram showing a tumor.",
+            "Breast tumor visible in the imaging.",
+            "Abnormal breast tissue mass.",
+        ],
+        'lung_CT': [
+            "A medical lung CT scan showing a lesion.",
+            "Lung nodule visible in CT imaging.",
+            "Abnormal lung tissue in CT scan.",
+        ],
+        'lung_Xray': [
+            "A medical chest X-ray showing a lesion.",
+            "Lung abnormality visible in X-ray.",
+            "Abnormal lung tissue in chest radiography.",
+        ],
     }
     
     def __init__(self, dataset_root: str, device: str = "cuda:0", checkpoint_path: Optional[str] = None):
@@ -154,79 +172,33 @@ class DatasetEvaluator:
         self.baseline_model = BiomedCLIPBaseline(device=device, checkpoint_path=checkpoint_path)
         self.results = defaultdict(list)
         
-    def compute_dice_coefficient(self, gt_mask: np.ndarray, pred_mask: np.ndarray) -> float:
+    def compute_similarity(self, image_features: np.ndarray, text_features: np.ndarray) -> float:
         """
-        Compute Dice coefficient between ground truth and predicted masks.
+        Compute cosine similarity between image and text features.
         
         Args:
-            gt_mask: Ground truth mask (H, W) with values in {0, 1}
-            pred_mask: Predicted mask (H, W) with values in {0, 1}
+            image_features: Image feature vector (D,)
+            text_features: Text feature vector (D,)
             
         Returns:
-            Dice coefficient in [0, 1]
+            Similarity score in [0, 1]
         """
-        if compute_dice_coefficient is not None:
-            return compute_dice_coefficient(gt_mask.astype(bool), pred_mask.astype(bool))
-        
-        # Fallback: manual computation
-        intersection = np.sum(gt_mask & pred_mask)
-        dice = 2.0 * intersection / (np.sum(gt_mask) + np.sum(pred_mask) + 1e-8)
-        return float(dice)
+        from scipy.spatial.distance import cosine
+        # cosine distance returns 0-1, convert to similarity
+        similarity = 1.0 - cosine(image_features, text_features)
+        return float(similarity)
     
-    def compute_iou(self, gt_mask: np.ndarray, pred_mask: np.ndarray) -> float:
+    def evaluate_dataset(self, dataset_name: str, split: str = 'test', max_samples: int = 100) -> Dict:
         """
-        Compute Intersection over Union (IoU).
-        
-        Args:
-            gt_mask: Ground truth mask (H, W) with values in {0, 1}
-            pred_mask: Predicted mask (H, W) with values in {0, 1}
-            
-        Returns:
-            IoU in [0, 1]
-        """
-        intersection = np.sum(gt_mask & pred_mask)
-        union = np.sum(gt_mask | pred_mask)
-        iou = intersection / (union + 1e-8)
-        return float(iou)
-    
-    def preprocess_masks(self, gt_mask: np.ndarray, pred_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Preprocess masks to ensure they have matching sizes and are binary.
-        
-        Args:
-            gt_mask: Ground truth mask
-            pred_mask: Predicted mask
-            
-        Returns:
-            Tuple of preprocessed (gt_mask, pred_mask)
-        """
-        # Ensure same size
-        if gt_mask.shape != pred_mask.shape:
-            pred_mask = cv2.resize(pred_mask, (gt_mask.shape[1], gt_mask.shape[0]), 
-                                   interpolation=cv2.INTER_NEAREST)
-        
-        # Convert to binary (threshold at 127 for uint8)
-        if len(gt_mask.shape) == 3:
-            gt_mask = cv2.cvtColor(gt_mask, cv2.COLOR_BGR2GRAY)
-        if len(pred_mask.shape) == 3:
-            pred_mask = cv2.cvtColor(pred_mask, cv2.COLOR_BGR2GRAY)
-        
-        # Binarize
-        _, gt_mask = cv2.threshold(gt_mask, 127, 1, cv2.THRESH_BINARY)
-        _, pred_mask = cv2.threshold(pred_mask, 127, 1, cv2.THRESH_BINARY)
-        
-        return gt_mask.astype(np.uint8), pred_mask.astype(np.uint8)
-    
-    def evaluate_dataset(self, dataset_name: str, split: str = 'test') -> Dict:
-        """
-        Evaluate baseline model on a specific dataset.
+        Evaluate semantic similarity between images and prompts.
         
         Args:
             dataset_name: Name of dataset (e.g., 'brain_tumors')
             split: Data split ('test', 'val', or 'train')
+            max_samples: Maximum number of samples to evaluate
             
         Returns:
-            Dictionary with evaluation metrics
+            Dictionary with evaluation results
         """
         print(f"\n{'='*60}")
         print(f"Evaluating {self.DATASETS[dataset_name]} ({split})")
@@ -234,14 +206,10 @@ class DatasetEvaluator:
         
         dataset_path = self.dataset_root / dataset_name
         images_dir = dataset_path / f"{split}_images"
-        masks_dir = dataset_path / f"{split}_masks"
         
-        # Check if directories exist
+        # Check if directory exists
         if not images_dir.exists():
             print(f"✗ Images directory not found: {images_dir}")
-            return {}
-        if not masks_dir.exists():
-            print(f"✗ Masks directory not found: {masks_dir}")
             return {}
         
         # Get list of images
@@ -252,72 +220,83 @@ class DatasetEvaluator:
             print(f"✗ No images found in {images_dir}")
             return {}
         
+        # Limit to max_samples
+        if len(image_files) > max_samples:
+            image_files = image_files[:max_samples]
+        
         print(f"Found {len(image_files)} images")
+        
+        # Get prompts for this dataset
+        prompts = self.PROMPTS.get(dataset_name, self.PROMPTS['brain_tumors'])
         
         # Metrics storage
         metrics = {
             'images': [],
-            'dice': [],
-            'iou': [],
+            'similarities': [],  # Store per-prompt similarities
         }
         
         # Evaluate each image
         for img_file in tqdm(image_files, desc="Evaluating"):
             img_path = images_dir / img_file
-            mask_path = masks_dir / img_file
-            
-            if not mask_path.exists():
-                print(f"  Warning: Mask not found for {img_file}")
-                continue
             
             try:
-                # Load images
+                # Load image
                 image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-                gt_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-                
-                if image is None or gt_mask is None:
+                if image is None:
                     print(f"  Error: Could not load {img_file}")
                     continue
                 
-                # For baseline: use simple thresholding as a dummy prediction
-                # (This is just to establish baseline performance with existing masks)
-                # In practice, you would use the model for inference here
-                pred_mask = image.copy()
+                # Convert grayscale to RGB
+                if len(image.shape) == 2:
+                    image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+                elif image.shape[2] != 3:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 
-                # Preprocess
-                gt_mask, pred_mask = self.preprocess_masks(gt_mask, pred_mask)
+                # Convert to tensor
+                image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                image_tensor = image_tensor.to(self.baseline_model.device)
                 
-                # Compute metrics
-                dice = self.compute_dice_coefficient(gt_mask, pred_mask)
-                iou = self.compute_iou(gt_mask, pred_mask)
+                # Get image features
+                with torch.no_grad():
+                    image_features = self.baseline_model.get_image_features(image_tensor)
                 
+                # Get text features for all prompts
+                with torch.no_grad():
+                    text_features = self.baseline_model.get_text_features(prompts)
+                
+                # Compute similarities
+                similarities = []
+                image_feat_np = image_features.cpu().numpy()[0]  # (D,)
+                for i in range(len(prompts)):
+                    text_feat_np = text_features.cpu().numpy()[i]  # (D,)
+                    similarity = self.compute_similarity(image_feat_np, text_feat_np)
+                    similarities.append(similarity)
+                
+                avg_similarity = np.mean(similarities)
                 metrics['images'].append(img_file)
-                metrics['dice'].append(dice)
-                metrics['iou'].append(iou)
+                metrics['similarities'].append(avg_similarity)
                 
             except Exception as e:
                 print(f"  Error processing {img_file}: {e}")
                 continue
         
         # Compute statistics
-        if metrics['dice']:
-            dice_mean = np.mean(metrics['dice'])
-            dice_std = np.std(metrics['dice'])
-            iou_mean = np.mean(metrics['iou'])
-            iou_std = np.std(metrics['iou'])
+        if metrics['similarities']:
+            sim_mean = np.mean(metrics['similarities'])
+            sim_std = np.std(metrics['similarities'])
             
             print(f"\nResults for {self.DATASETS[dataset_name]}:")
-            print(f"  Dice: {dice_mean:.4f} ± {dice_std:.4f}")
-            print(f"  IoU:  {iou_mean:.4f} ± {iou_std:.4f}")
+            print(f"  Avg Similarity: {sim_mean:.4f} ± {sim_std:.4f}")
+            print(f"  (Lower values are typical; focus on consistency)")
             
             return {
                 'dataset': dataset_name,
                 'split': split,
-                'num_images': len(metrics['dice']),
-                'dice_mean': dice_mean,
-                'dice_std': dice_std,
-                'iou_mean': iou_mean,
-                'iou_std': iou_std,
+                'num_images': len(metrics['similarities']),
+                'similarity_mean': sim_mean,
+                'similarity_std': sim_std,
                 'metrics': metrics
             }
         else:
@@ -353,10 +332,10 @@ class DatasetEvaluator:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Save summary CSV
-        summary_csv = output_dir / "baseline_summary.csv"
+        summary_csv = output_dir / "semantic_check_summary.csv"
         with open(summary_csv, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
-                'dataset', 'split', 'num_images', 'dice_mean', 'dice_std', 'iou_mean', 'iou_std'
+                'dataset', 'split', 'num_images', 'similarity_mean', 'similarity_std'
             ])
             writer.writeheader()
             for result in results:
@@ -364,10 +343,8 @@ class DatasetEvaluator:
                     'dataset': result['dataset'],
                     'split': result['split'],
                     'num_images': result['num_images'],
-                    'dice_mean': f"{result['dice_mean']:.4f}",
-                    'dice_std': f"{result['dice_std']:.4f}",
-                    'iou_mean': f"{result['iou_mean']:.4f}",
-                    'iou_std': f"{result['iou_std']:.4f}",
+                    'similarity_mean': f"{result['similarity_mean']:.4f}",
+                    'similarity_std': f"{result['similarity_std']:.4f}",
                 })
         
         print(f"\n✓ Summary saved to {summary_csv}")
@@ -375,21 +352,18 @@ class DatasetEvaluator:
         # Save detailed results JSON
         for result in results:
             dataset_name = result['dataset']
-            result_json = output_dir / f"baseline_{dataset_name}_detailed.json"
+            result_json = output_dir / f"semantic_check_{dataset_name}_detailed.json"
             
             # Convert numpy arrays to lists for JSON serialization
             json_result = {
                 'dataset': result['dataset'],
                 'split': result['split'],
                 'num_images': result['num_images'],
-                'dice_mean': float(result['dice_mean']),
-                'dice_std': float(result['dice_std']),
-                'iou_mean': float(result['iou_mean']),
-                'iou_std': float(result['iou_std']),
+                'similarity_mean': float(result['similarity_mean']),
+                'similarity_std': float(result['similarity_std']),
                 'metrics': {
                     'images': result['metrics']['images'],
-                    'dice': [float(x) for x in result['metrics']['dice']],
-                    'iou': [float(x) for x in result['metrics']['iou']],
+                    'similarities': [float(x) for x in result['metrics']['similarities']],
                 }
             }
             
@@ -402,7 +376,7 @@ class DatasetEvaluator:
 def main():
     """Main evaluation pipeline."""
     parser = argparse.ArgumentParser(
-        description="Evaluate baseline BiomedCLIP model without adapters"
+        description="Semantic sanity check for BiomedCLIP model"
     )
     parser.add_argument(
         '--dataset-root',
@@ -413,7 +387,7 @@ def main():
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='./baseline_results',
+        default='./semantic_check_results',
         help='Directory to save evaluation results'
     )
     parser.add_argument(
@@ -435,37 +409,50 @@ def main():
         choices=['test', 'val', 'train'],
         help='Data split to evaluate'
     )
+    parser.add_argument(
+        '--max-samples',
+        type=int,
+        default=100,
+        help='Maximum samples to evaluate per dataset'
+    )
     
     args = parser.parse_args()
     
     # Create evaluator
     print("="*60)
-    print("BiomedCLIP Baseline Evaluation")
+    print("BiomedCLIP Semantic Sanity Check")
     print("="*60)
     print(f"Dataset root: {args.dataset_root}")
     print(f"Output directory: {args.output_dir}")
     print(f"Device: {args.device}")
     print(f"Checkpoint: {args.checkpoint_path or 'HuggingFace (chuhac/BiomedCLIP-vit-bert-hf)'}")
     print(f"Split: {args.split}")
+    print(f"Max samples: {args.max_samples}")
+    print("="*60)
+    print("NOTE: This is a semantic sanity check, not segmentation evaluation.")
+    print("      For segmentation metrics, use postprocess_saliency_maps.py")
     print("="*60)
     
     evaluator = DatasetEvaluator(args.dataset_root, device=args.device, checkpoint_path=args.checkpoint_path)
     
     # Evaluate all datasets
-    results = evaluator.evaluate_all_datasets(split=args.split)
+    results = []
+    for dataset_name in evaluator.DATASETS.keys():
+        result = evaluator.evaluate_dataset(dataset_name, split=args.split, max_samples=args.max_samples)
+        if result:
+            results.append(result)
     
     # Save results
     evaluator.save_results(results, args.output_dir)
     
     # Print summary
     print("\n" + "="*60)
-    print("BASELINE EVALUATION SUMMARY")
+    print("SEMANTIC SANITY CHECK SUMMARY")
     print("="*60)
     for result in results:
         print(f"\n{result['dataset']}:")
-        print(f"  Images: {result['num_images']}")
-        print(f"  Dice: {result['dice_mean']:.4f} ± {result['dice_std']:.4f}")
-        print(f"  IoU:  {result['iou_mean']:.4f} ± {result['iou_std']:.4f}")
+        print(f"  Images evaluated: {result['num_images']}")
+        print(f"  Avg similarity: {result['similarity_mean']:.4f} ± {result['similarity_std']:.4f}")
     print("="*60)
 
 
