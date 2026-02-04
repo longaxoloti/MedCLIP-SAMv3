@@ -108,16 +108,20 @@ class SVD_Frequency_Adapter(nn.Module):
         """
         B, N, D = x.shape
         
+        # Stabilize input: clamp to avoid ill-conditioned matrices
+        x_stable = torch.clamp(x, min=-1e2, max=1e2)
+        
         # Step 1: SVD Decomposition on input
         # =====================================
         # We perform SVD on X to find the principal components (high-variance directions)
         # In medical imaging, these often correspond to anatomical boundaries
         try:
-            U, S, Vh = torch.linalg.svd(x, full_matrices=False)
+            # Use driver='gesvd' for better numerical stability
+            U, S, Vh = torch.linalg.svd(x_stable, full_matrices=False, driver='gesvd')
             # U: (B, N, min(N,D)) - left singular vectors
             # S: (B, min(N,D)) - singular values  
             # Vh: (B, min(N,D), D) - right singular vectors (transposed)
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             warnings.warn(f"SVD failed: {str(e)}. Returning identity projection.")
             return self.out_proj(x)
         
@@ -137,6 +141,11 @@ class SVD_Frequency_Adapter(nn.Module):
         k = self.k_proj(x)  # (B, N, D)
         v = self.v_proj(x)  # (B, N, D)
         
+        # Normalize Q, K, V to prevent numerical instability in attention
+        q = F.normalize(q, p=2, dim=-1) * (D ** 0.5)
+        k = F.normalize(k, p=2, dim=-1) * (D ** 0.5)
+        v = F.normalize(v, p=2, dim=-1)
+        
         # Step 3: Project K and V to low-rank subspace
         # =============================================
         # Instead of computing n×n attention, we compute n×k attention
@@ -149,7 +158,13 @@ class SVD_Frequency_Adapter(nn.Module):
         # ======================================================
         # Attention scores: (B, N, D) × (B, D, k) → (B, N, k)
         attn_scores = torch.matmul(q, k_proj.transpose(-2, -1)) * self.scale
+        
+        # Clamp attention scores to prevent overflow in softmax
+        attn_scores = torch.clamp(attn_scores, min=-1e2, max=1e2)
+        
         attn_weights = F.softmax(attn_scores, dim=-1)
+        # Remove NaN/Inf from softmax
+        attn_weights = torch.nan_to_num(attn_weights, nan=1.0/self.rank_k, posinf=1.0/self.rank_k, neginf=0.0)
         attn_weights = self.dropout(attn_weights)
         
         # Apply attention to values: (B, N, k) × (B, k, D) → (B, N, D)

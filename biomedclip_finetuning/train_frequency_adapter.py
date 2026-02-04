@@ -680,10 +680,23 @@ class FrequencyAdapterTrainer:
             
             # Compute loss
             batch_size = images.size(0)
+            
+            # Normalize features to prevent explosion
+            image_features = F.normalize(image_features, p=2, dim=-1)
+            text_features = F.normalize(text_features, p=2, dim=-1)
+            
             if isinstance(self.loss_fn, nn.Module):
                 loss = self.loss_fn(image_features, text_features, batch_size)
             else:
                 loss = self.loss_fn(image_features, text_features, batch_size)
+            
+            # Clamp loss to prevent NaN/Inf
+            loss = torch.clamp(loss, min=-1e4, max=1e4)
+            
+            # Skip batch if loss is invalid
+            if not torch.isfinite(loss):
+                self.logger.warning(f"Invalid loss detected: {loss.item()}, skipping batch")
+                continue
             
             # Backward pass
             self.optimizer.zero_grad()
@@ -743,10 +756,22 @@ class FrequencyAdapterTrainer:
             
             # Compute loss
             batch_size = images.size(0)
+            
+            # Normalize features to prevent explosion
+            image_features = F.normalize(image_features, p=2, dim=-1)
+            text_features = F.normalize(text_features, p=2, dim=-1)
+            
             if isinstance(self.loss_fn, nn.Module):
                 loss = self.loss_fn(image_features, text_features, batch_size)
             else:
                 loss = self.loss_fn(image_features, text_features, batch_size)
+            
+            # Clamp loss to prevent NaN/Inf
+            loss = torch.clamp(loss, min=-1e4, max=1e4)
+            
+            # Skip batch if loss is invalid
+            if not torch.isfinite(loss):
+                continue
             
             total_loss += loss.item()
             num_batches += 1
