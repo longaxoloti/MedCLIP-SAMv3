@@ -669,6 +669,7 @@ class FrequencyAdapterTrainer:
         
         total_loss = 0.0
         num_batches = 0
+        num_skipped = 0
         
         pbar = tqdm(train_loader, desc="Training")
         for batch in pbar:
@@ -694,8 +695,18 @@ class FrequencyAdapterTrainer:
             text_outputs = self.model.text_model(**text_tokens)
             text_features = self._get_pooled_output(text_outputs)
             
-            # Compute loss
-            batch_size = images.size(0)
+            # Numerical stability check 1: Check feature magnitudes
+            img_feat_norm = torch.norm(image_features, p=2, dim=-1).mean().item()
+            txt_feat_norm = torch.norm(text_features, p=2, dim=-1).mean().item()
+            
+            if img_feat_norm > 1e3 or txt_feat_norm > 1e3 or img_feat_norm < 1e-3 or txt_feat_norm < 1e-3:
+                self.logger.warning(f"Feature norm out of range: img={img_feat_norm:.2e}, txt={txt_feat_norm:.2e}, skipping batch")
+                num_skipped += 1
+                continue
+            
+            # Clamp extreme feature values to prevent NaN in loss computation
+            image_features = torch.clamp(image_features, min=-100, max=100)
+            text_features = torch.clamp(text_features, min=-100, max=100)
             
             # Compute loss
             batch_size = images.size(0)
@@ -708,24 +719,40 @@ class FrequencyAdapterTrainer:
             # Note: Negative losses are normal for DHN-NCE when positive samples are harder than negatives
             if not torch.isfinite(loss):
                 self.logger.warning(f"Invalid loss detected: {loss.item()}, skipping batch")
+                num_skipped += 1
+                continue
+            
+            # Additional check: loss should be reasonable magnitude
+            if abs(loss.item()) > 1e2:
+                self.logger.warning(f"Loss magnitude too large: {loss.item():.2e}, skipping batch")
+                num_skipped += 1
                 continue
             
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # Check for gradient explosion before clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+            if grad_norm > 100.0:
+                self.logger.warning(f"Large gradient norm detected: {grad_norm:.2e}")
+            
             self.optimizer.step()
             
             total_loss += loss.item()
             num_batches += 1
             
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'skipped': num_skipped})
         
         avg_loss = total_loss / max(num_batches, 1)
         
+        if num_skipped > 0:
+            self.logger.info(f"Skipped {num_skipped} batches due to numerical issues")
+        
         return {
             'loss': avg_loss,
-            'num_batches': num_batches
+            'num_batches': num_batches,
+            'num_skipped': num_skipped
         }
     
     @torch.no_grad()
@@ -743,6 +770,7 @@ class FrequencyAdapterTrainer:
         
         total_loss = 0.0
         num_batches = 0
+        num_skipped = 0
         
         for batch in tqdm(val_loader, desc="Validating"):
             # Move to device
@@ -766,6 +794,19 @@ class FrequencyAdapterTrainer:
             text_outputs = self.model.text_model(**text_tokens)
             text_features = self._get_pooled_output(text_outputs)
             
+            # Numerical stability check: Check feature magnitudes
+            img_feat_norm = torch.norm(image_features, p=2, dim=-1).mean().item()
+            txt_feat_norm = torch.norm(text_features, p=2, dim=-1).mean().item()
+            
+            if img_feat_norm > 1e3 or txt_feat_norm > 1e3 or img_feat_norm < 1e-3 or txt_feat_norm < 1e-3:
+                self.logger.warning(f"[Val] Feature norm out of range: img={img_feat_norm:.2e}, txt={txt_feat_norm:.2e}, skipping batch")
+                num_skipped += 1
+                continue
+            
+            # Clamp extreme feature values to prevent NaN in loss computation
+            image_features = torch.clamp(image_features, min=-100, max=100)
+            text_features = torch.clamp(text_features, min=-100, max=100)
+            
             # Compute loss
             batch_size = images.size(0)
             
@@ -776,6 +817,14 @@ class FrequencyAdapterTrainer:
             # Skip batch if loss is invalid (NaN or Inf only)
             # Note: Negative losses are normal for DHN-NCE
             if not torch.isfinite(loss):
+                self.logger.warning(f"[Val] Invalid loss detected: {loss.item()}, skipping batch")
+                num_skipped += 1
+                continue
+            
+            # Additional check: loss should be reasonable magnitude
+            if abs(loss.item()) > 1e2:
+                self.logger.warning(f"[Val] Loss magnitude too large: {loss.item():.2e}, skipping batch")
+                num_skipped += 1
                 continue
             
             total_loss += loss.item()
@@ -783,9 +832,13 @@ class FrequencyAdapterTrainer:
         
         avg_loss = total_loss / max(num_batches, 1)
         
+        if num_skipped > 0:
+            self.logger.info(f"[Val] Skipped {num_skipped} batches due to numerical issues")
+        
         return {
             'loss': avg_loss,
-            'num_batches': num_batches
+            'num_batches': num_batches,
+            'num_skipped': num_skipped
         }
     
     def save_checkpoint(self, epoch: int, metrics: Dict):
@@ -983,12 +1036,24 @@ class FrequencyAdapterTrainer:
             # Train
             train_metrics = self.train_epoch(train_loader)
             
+            # Check training quality
+            skip_ratio = train_metrics.get('num_skipped', 0) / max(len(train_loader), 1)
+            if skip_ratio > 0.5:
+                self.logger.warning(f"High skip ratio in training: {skip_ratio:.1%}. This may cause optimizer state issues.")
+                self.logger.warning("Reinitializing optimizer to prevent divergence in next epoch.")
+                self._setup_optimizer()
+            
             # Validate
             val_metrics = self.validate(val_loader)
             
+            # Check validation quality
+            val_skip_ratio = val_metrics.get('num_skipped', 0) / max(len(val_loader), 1)
+            if val_skip_ratio > 0.5:
+                self.logger.warning(f"High skip ratio in validation: {val_skip_ratio:.1%}")
+            
             # Log metrics
-            self.logger.info(f"Train loss: {train_metrics['loss']:.4f}")
-            self.logger.info(f"Val loss: {val_metrics['loss']:.4f}")
+            self.logger.info(f"Train loss: {train_metrics['loss']:.4f} ({train_metrics.get('num_skipped', 0)}/{len(train_loader)} skipped)")
+            self.logger.info(f"Val loss: {val_metrics['loss']:.4f} ({val_metrics.get('num_skipped', 0)}/{len(val_loader)} skipped)")
             
             # Save history
             training_history['epoch'].append(epoch + 1)
