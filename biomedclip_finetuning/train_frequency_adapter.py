@@ -508,9 +508,8 @@ class FrequencyAdapterTrainer:
         self.tokenizer = None
         self._load_model()
         
-        # Setup loss
-        self.loss_fn = HardNegativeLoss(temperature=0.07, beta1=1.0, beta2=1.0, alpha=0) \
-                        if HardNegativeLoss else self._simple_contrastive_loss
+        # Setup loss - Use DHN-NCE (HardNegativeLoss with alpha=0 for Decoupled)
+        self.loss_fn = HardNegativeLoss(temperature=0.07, beta1=1.0, beta2=1.0, alpha=0)
         
         # Setup optimizer
         self.optimizer = None
@@ -622,16 +621,14 @@ class FrequencyAdapterTrainer:
         Simple contrastive loss as fallback when DHN-NCE is not available.
         
         Args:
-            image_features: Image features (B, D)
-            text_features: Text features (B, D)
+            image_features: Image features (B, D) - ALREADY NORMALIZED
+            text_features: Text features (B, D) - ALREADY NORMALIZED
             batch_size: Batch size
             
         Returns:
             Scalar loss
         """
-        # Normalize features
-        image_features = F.normalize(image_features, p=2, dim=1)
-        text_features = F.normalize(text_features, p=2, dim=1)
+        # Features are already normalized from the training loop, don't normalize again
         
         # Compute similarity
         logits = torch.matmul(image_features, text_features.t()) / 0.07
@@ -700,19 +697,15 @@ class FrequencyAdapterTrainer:
             # Compute loss
             batch_size = images.size(0)
             
-            # Normalize features to prevent explosion
-            image_features = F.normalize(image_features, p=2, dim=-1)
-            text_features = F.normalize(text_features, p=2, dim=-1)
+            # Compute loss
+            batch_size = images.size(0)
             
-            if isinstance(self.loss_fn, nn.Module):
-                loss = self.loss_fn(image_features, text_features, batch_size)
-            else:
-                loss = self.loss_fn(image_features, text_features, batch_size)
+            # Call loss function - HardNegativeLoss normalizes features internally
+            # Do NOT normalize features before calling loss (would double-normalize)
+            loss = self.loss_fn(image_features, text_features, batch_size)
             
-            # Clamp loss to prevent NaN/Inf
-            loss = torch.clamp(loss, min=-1e4, max=1e4)
-            
-            # Skip batch if loss is invalid
+            # Skip batch if loss is invalid (NaN or Inf only)
+            # Note: Negative losses are normal for DHN-NCE when positive samples are harder than negatives
             if not torch.isfinite(loss):
                 self.logger.warning(f"Invalid loss detected: {loss.item()}, skipping batch")
                 continue
@@ -776,19 +769,12 @@ class FrequencyAdapterTrainer:
             # Compute loss
             batch_size = images.size(0)
             
-            # Normalize features to prevent explosion
-            image_features = F.normalize(image_features, p=2, dim=-1)
-            text_features = F.normalize(text_features, p=2, dim=-1)
+            # Call loss function - HardNegativeLoss normalizes features internally
+            # Do NOT normalize features before calling loss (would double-normalize)
+            loss = self.loss_fn(image_features, text_features, batch_size)
             
-            if isinstance(self.loss_fn, nn.Module):
-                loss = self.loss_fn(image_features, text_features, batch_size)
-            else:
-                loss = self.loss_fn(image_features, text_features, batch_size)
-            
-            # Clamp loss to prevent NaN/Inf
-            loss = torch.clamp(loss, min=-1e4, max=1e4)
-            
-            # Skip batch if loss is invalid
+            # Skip batch if loss is invalid (NaN or Inf only)
+            # Note: Negative losses are normal for DHN-NCE
             if not torch.isfinite(loss):
                 continue
             
