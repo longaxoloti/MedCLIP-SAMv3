@@ -40,16 +40,26 @@ def _patch_clip_symbols_for_biomedclip():
     try:
         from transformers.models.clip.modeling_clip import (
             CLIPMLP, CLIPVisionEmbeddings, CLIPVisionTransformer,
-            CLIPTextEmbeddings, CLIPEncoder, CLIPAttention
+            CLIPTextEmbeddings, CLIPEncoder, CLIPAttention,
+            CLIPTextTransformer, CLIPOutput, CLIPPreTrainedModel
         )
+        from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
+        
         builtins.CLIPMLP = CLIPMLP
         builtins.CLIPVisionEmbeddings = CLIPVisionEmbeddings
         builtins.CLIPVisionTransformer = CLIPVisionTransformer
         builtins.CLIPTextEmbeddings = CLIPTextEmbeddings
         builtins.CLIPEncoder = CLIPEncoder
         builtins.CLIPAttention = CLIPAttention
-    except ImportError as e:
+        builtins.CLIPTextTransformer = CLIPTextTransformer
+        builtins.CLIPOutput = CLIPOutput
+        builtins.CLIPPreTrainedModel = CLIPPreTrainedModel
+        builtins.BaseModelOutput = BaseModelOutput
+        builtins.BaseModelOutputWithPooling = BaseModelOutputWithPooling
+    except Exception as e:
         print(f"[WARN] Could not patch all CLIP symbols: {e}")
+    except ImportError as e:
+        print(f"[WARN] Could not import CLIP symbols (will try at runtime): {e}")
 
 
 def calculate_dice_coefficient(mask1, mask2):
