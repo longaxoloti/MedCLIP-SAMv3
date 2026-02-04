@@ -563,6 +563,9 @@ class FrequencyAdapterTrainer:
                 gamma_init=self.gamma_init
             )
             
+            # Patch text config to fix CLIPTextConfig compatibility
+            self._patch_text_config()
+            
             # Freeze backbone, unfreeze adapters
             freeze_backbone_unfreeze_adapter(self.model)
             
@@ -580,6 +583,22 @@ class FrequencyAdapterTrainer:
         except Exception as e:
             self.logger.error(f"Failed to load model: {e}")
             raise
+    
+    def _patch_text_config(self):
+        """Patch CLIPTextConfig to add missing is_decoder attribute."""
+        try:
+            if hasattr(self.model, 'text_model') and hasattr(self.model.text_model, 'config'):
+                config = self.model.text_model.config
+                # Add missing attributes that CLIPTextConfig doesn't have
+                if not hasattr(config, 'is_decoder'):
+                    config.is_decoder = False
+                if not hasattr(config, 'add_cross_attention'):
+                    config.add_cross_attention = False
+                if not hasattr(config, 'use_cache'):
+                    config.use_cache = False
+                self.logger.info("✓ Text config patched for compatibility")
+        except Exception as e:
+            self.logger.warning(f"Could not patch text config: {e}")
     
     def _setup_optimizer(self):
         """Setup optimizer and scheduler."""
