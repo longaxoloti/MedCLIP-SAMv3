@@ -15,8 +15,7 @@ def sigmoid(x):
 def postprocess_crf(args):
     files = os.listdir(args.sal_path)
 
-    if (not os.path.exists(args.output_path)):
-        os.makedirs(args.output_path)
+    os.makedirs(args.output_path, exist_ok=True)
 
     for file in tqdm(files):
 
@@ -70,8 +69,7 @@ def postprocess_crf(args):
 def postprocess_thresholding(args):
     files = os.listdir(args.sal_path)
 
-    if (not os.path.exists(args.output_path)):
-        os.makedirs(args.output_path)
+    os.makedirs(args.output_path, exist_ok=True)
 
     for file in tqdm(files):
 
@@ -105,8 +103,7 @@ def postprocess_kmeans(args):
     
     files = os.listdir(args.sal_path)
 
-    if (not os.path.exists(args.output_path)):
-        os.makedirs(args.output_path)
+    os.makedirs(args.output_path, exist_ok=True)
 
     for file in tqdm(files):
 
