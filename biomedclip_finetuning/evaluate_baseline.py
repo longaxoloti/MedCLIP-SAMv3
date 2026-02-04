@@ -60,6 +60,7 @@ class BiomedCLIPBaseline:
         
         try:
             from transformers import AutoModel, AutoProcessor, AutoTokenizer
+            from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
             
             # Default HuggingFace model
             hf_model_name = "chuhac/BiomedCLIP-vit-bert-hf"

@@ -31,15 +31,25 @@ if str(PROJECT_ROOT) not in sys.path:
 from biomedclip_finetuning.frequency_adapter import inject_frequency_adapters
 
 
-def _patch_clipmlp_for_biomedclip():
-    """Patch missing CLIPMLP symbol for certain BiomedCLIP HF remote modules."""
-    if getattr(builtins, 'CLIPMLP', None) is not None:
-        return
+def _patch_clip_symbols_for_biomedclip():
+    """Patch missing CLIP symbols for BiomedCLIP HF remote modules.
+    
+    BiomedCLIP's remote module references CLIP classes that may not be in global scope.
+    We inject them into builtins so they can be found during module loading.
+    """
     try:
-        from transformers.models.clip.modeling_clip import CLIPMLP
+        from transformers.models.clip.modeling_clip import (
+            CLIPMLP, CLIPVisionEmbeddings, CLIPVisionTransformer,
+            CLIPTextEmbeddings, CLIPEncoder, CLIPAttention
+        )
         builtins.CLIPMLP = CLIPMLP
-    except Exception:
-        pass
+        builtins.CLIPVisionEmbeddings = CLIPVisionEmbeddings
+        builtins.CLIPVisionTransformer = CLIPVisionTransformer
+        builtins.CLIPTextEmbeddings = CLIPTextEmbeddings
+        builtins.CLIPEncoder = CLIPEncoder
+        builtins.CLIPAttention = CLIPAttention
+    except ImportError as e:
+        print(f"[WARN] Could not patch all CLIP symbols: {e}")
 
 
 def calculate_dice_coefficient(mask1, mask2):
@@ -130,7 +140,7 @@ def hyper_opt(model, processor, tokenizer, text, args):
 
 
 def load_biomedclip_with_adapters(args):
-    _patch_clipmlp_for_biomedclip()
+    _patch_clip_symbols_for_biomedclip()
     base_checkpoint_file = None
     if args.checkpoint_path:
         if os.path.isfile(args.checkpoint_path):
