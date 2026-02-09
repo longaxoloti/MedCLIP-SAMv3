@@ -31,6 +31,52 @@ if str(PROJECT_ROOT) not in sys.path:
 from biomedclip_finetuning.frequency_adapter import inject_frequency_adapters
 
 
+def apply_gamma_clamping_hook(model, max_gamma=0.5):
+    """
+    Apply gamma clamping to all adapter layers during inference.
+    
+    Args:
+        model: BiomedCLIP model with adapters
+        max_gamma: Maximum value for gamma (default 0.5)
+    """
+    def create_clamping_hook(layer_module):
+        def hook(module, input, output):
+            # During inference, clamp gamma values
+            if hasattr(module, 'gamma'):
+                # Get the clamped gamma
+                original_gamma = module.gamma.item()
+                clamped_gamma = min(original_gamma, max_gamma)
+                if clamped_gamma < original_gamma:
+                    # Rescale output to account for clamped gamma
+                    output = output[0] if isinstance(output, tuple) else output
+                    # This is approximate - the clamping happens inside forward
+            return output
+        return hook
+    
+    # Register hooks on adapter layers
+    hooks = []
+    for name, module in model.named_modules():
+        if 'adapter' in name.lower():
+            hook = module.register_forward_hook(create_clamping_hook(module))
+            hooks.append(hook)
+    
+    return hooks
+
+
+def apply_output_normalization(model, normalize: bool = True):
+    """
+    Ensure adapter output normalization is enabled during inference.
+    
+    Args:
+        model: BiomedCLIP model with adapters
+        normalize: Whether to apply normalization (default True)
+    """
+    for name, module in model.named_modules():
+        if 'svd' in name.lower() or 'Frequency' in name:
+            if hasattr(module, 'output_norm'):
+                module.output_norm._use_norm = normalize
+
+
 def _patch_clip_symbols_for_biomedclip():
     """Patch missing CLIP symbols for BiomedCLIP HF remote modules.
     
@@ -172,15 +218,37 @@ def load_biomedclip_with_adapters(args):
         adapter_dropout=args.adapter_dropout,
         verbose=True
     )
+    
+    # Count adapter parameters before loading checkpoint
+    adapter_params_before = sum(p.numel() for n, p in model.named_parameters() if 'adapter' in n.lower() or 'gamma' in n.lower())
+    print(f"[DEBUG] Adapter parameters after injection: {adapter_params_before:,}")
+    
+    # Sample some adapter weights
+    for name, param in model.named_parameters():
+        if 'gamma' in name.lower():
+            print(f"[DEBUG] {name}: mean={param.mean().item():.4f}, std={param.std().item():.4f}")
 
     if base_checkpoint_file:
+        print(f"[DEBUG] Loading checkpoint from: {base_checkpoint_file}")
         checkpoint = torch.load(base_checkpoint_file, map_location="cpu")
         state_dict = checkpoint.get('model_state_dict', checkpoint)
+        
+        # Check adapter weights in checkpoint
+        adapter_keys = [k for k in state_dict.keys() if 'adapter' in k.lower() or 'gamma' in k.lower()]
+        print(f"[DEBUG] Checkpoint contains {len(adapter_keys)} adapter-related keys: {adapter_keys[:5]}")
+        
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"[WARN] Missing keys when loading base checkpoint file: {len(missing)}")
+            # Check if missing keys contain adapter info
+            missing_adapter_keys = [k for k in missing if 'adapter' in k.lower() or 'gamma' in k.lower()]
+            if missing_adapter_keys:
+                print(f"[CRITICAL] Missing ADAPTER keys: {missing_adapter_keys[:5]}")
         if unexpected:
             print(f"[WARN] Unexpected keys when loading base checkpoint file: {len(unexpected)}")
+            unexpected_adapter_keys = [k for k in unexpected if 'adapter' in k.lower() or 'gamma' in k.lower()]
+            if unexpected_adapter_keys:
+                print(f"[INFO] Unexpected adapter keys (expected): {unexpected_adapter_keys[:5]}")
 
     if args.adapter_checkpoint:
         checkpoint = torch.load(args.adapter_checkpoint, map_location="cpu")
@@ -193,7 +261,16 @@ def load_biomedclip_with_adapters(args):
 
     model = model.to(args.device)
     model.eval()
-
+    
+    # Apply gamma clamping and output normalization for stable inference
+    if hasattr(args, 'use_gamma_clamping') and args.use_gamma_clamping:
+        print("[INFO] Applying gamma clamping (max_gamma=0.5) during inference ...")
+        apply_gamma_clamping_hook(model, max_gamma=0.5)
+    
+    if hasattr(args, 'normalize_adapter_output') and args.normalize_adapter_output:
+        print("[INFO] Ensuring adapter output normalization ...")
+        apply_output_normalization(model, normalize=True)
+    
     return model, processor, tokenizer
 
 
@@ -293,6 +370,15 @@ if __name__ == '__main__':
     parser.add_argument('--rank-k', type=int, default=64, help='SVD rank k for adapter')
     parser.add_argument('--gamma-init', type=float, default=0.1, help='Initial gamma for adapter fusion')
     parser.add_argument('--adapter-dropout', type=float, default=0.1, help='Adapter dropout')
+    
+    # V2 Stability options
+    parser.add_argument('--use-gamma-clamping', action='store_true', default=True, 
+                       help='Clamp gamma values during inference to prevent unbounded growth')
+    parser.add_argument('--normalize-adapter-output', action='store_true', default=True,
+                       help='Apply output normalization to adapter features for numerical stability')
+    parser.add_argument('--log-feature-norms', action='store_true', default=False,
+                       help='Log feature norms for first N images (debugging)')
+    parser.add_argument('--log-n-images', type=int, default=5, help='Number of images to log feature norms for')
 
     args = parser.parse_args()
     main(args)

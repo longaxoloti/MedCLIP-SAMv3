@@ -62,6 +62,13 @@ except ImportError:
     print("Warning: Could not import DHN-NCE loss, using simplified contrastive loss")
     HardNegativeLoss = None
 
+try:
+    from loss.multi_task_loss import MultiTaskAdapterLoss, HardNegativeLoss as HNL
+    HardNegativeLoss = HNL
+except ImportError:
+    print("Warning: Could not import MultiTaskAdapterLoss")
+    MultiTaskAdapterLoss = None
+
 import cv2
 import json as json_lib
 
@@ -499,6 +506,14 @@ class FrequencyAdapterTrainer:
         self.gamma_init = gamma_init
         self.checkpoint_path = checkpoint_path
         
+        # Multi-task training parameters
+        self.multi_task_enabled = False  # Will be set to True in train() if enabled
+        self.lambda_gamma = 0.01  # Gamma regularization weight
+        self.lambda_magnitude = 0.001  # Feature magnitude constraint weight
+        self.lambda_spatial = 0.1  # Spatial structure preservation weight
+        self.gamma_target = gamma_init  # Target gamma value
+        self.use_segmentation_validation = False  # Will be set in train()
+        
         # Setup logging
         self._setup_logging()
         
@@ -511,12 +526,35 @@ class FrequencyAdapterTrainer:
         # Setup loss - Use DHN-NCE (HardNegativeLoss with alpha=0 for Decoupled)
         self.loss_fn = HardNegativeLoss(temperature=0.07, beta1=1.0, beta2=1.0, alpha=0)
         
+        # Setup multi-task loss (new V2)
+        if MultiTaskAdapterLoss is not None:
+            self.multi_task_loss = MultiTaskAdapterLoss(
+                temperature=0.07,
+                beta1=1.0,
+                beta2=1.0,
+                alpha=0,
+                lambda_contrastive=1.0,
+                lambda_gamma=self.lambda_gamma,
+                lambda_magnitude=self.lambda_magnitude,
+                lambda_spatial=self.lambda_spatial,
+                gamma_target=self.gamma_target,
+                feature_magnitude_threshold=1000.0,
+                spatial_loss_type='mse'
+            )
+        else:
+            self.multi_task_loss = None
+        
         # Setup optimizer
         self.optimizer = None
         self.scheduler = None
         self._setup_optimizer()
         
         self.logger.info(f"✓ Trainer initialized for {dataset_name}")
+        if self.multi_task_loss is not None:
+            self.logger.info(f"✓ Multi-task loss available (V2)")
+        else:
+            self.logger.info(f"⚠ Multi-task loss not available, will use basic loss")
+
     
     def _setup_logging(self):
         """Setup logging."""
@@ -655,12 +693,13 @@ class FrequencyAdapterTrainer:
             return model_outputs[0][:, 0]
         raise ValueError("Cannot extract pooled output from model outputs")
     
-    def train_epoch(self, train_loader: DataLoader) -> Dict:
+    def train_epoch(self, train_loader: DataLoader, epoch: int = 0) -> Dict:
         """
         Train for one epoch.
         
         Args:
             train_loader: Training data loader
+            epoch: Current epoch number (for logging)
             
         Returns:
             Dictionary with epoch statistics
@@ -668,11 +707,14 @@ class FrequencyAdapterTrainer:
         self.model.train()
         
         total_loss = 0.0
+        total_loss_gamma = 0.0
+        total_loss_mag = 0.0
         num_batches = 0
         num_skipped = 0
+        gamma_values_history = []  # Track gamma values during training
         
-        pbar = tqdm(train_loader, desc="Training")
-        for batch in pbar:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch} Training")
+        for batch_idx, batch in enumerate(pbar):
             # Move to device
             images = batch['image'].to(self.device)
             
@@ -711,9 +753,36 @@ class FrequencyAdapterTrainer:
             # Compute loss
             batch_size = images.size(0)
             
-            # Call loss function - HardNegativeLoss normalizes features internally
-            # Do NOT normalize features before calling loss (would double-normalize)
-            loss = self.loss_fn(image_features, text_features, batch_size)
+            # Get gamma values for regularization
+            gamma_values = []
+            for name, param in self.model.named_parameters():
+                if 'gamma' in name:
+                    gamma_values.append(param)
+            
+            # Use multi-task loss if available, otherwise use basic loss
+            if self.multi_task_enabled and self.multi_task_loss is not None:
+                loss, loss_components = self.multi_task_loss(
+                    image_features=image_features,
+                    text_features=text_features,
+                    batch_size=batch_size,
+                    gamma_values=gamma_values,
+                    saliency_with_adapter=None,  # Would need segmentation validation set
+                    saliency_without_adapter=None,
+                    return_components=True
+                )
+                loss_gamma_val = loss_components.get('loss_gamma', 0.0)
+                loss_mag_val = loss_components.get('loss_magnitude', 0.0)
+                total_loss_gamma += loss_gamma_val
+                total_loss_mag += loss_mag_val
+            else:
+                # Fall back to basic contrastive loss
+                # Call loss function - HardNegativeLoss normalizes features internally
+                loss = self.loss_fn(image_features, text_features, batch_size)
+                
+                # Optionally add gamma regularization even with basic loss
+                if len(gamma_values) > 0 and hasattr(self, 'lambda_gamma'):
+                    gamma_reg = sum((gamma - self.gamma_target) ** 2 for gamma in gamma_values)
+                    loss = loss + self.lambda_gamma * gamma_reg / len(gamma_values)
             
             # Skip batch if loss is invalid (NaN or Inf only)
             # Note: Negative losses are normal for DHN-NCE when positive samples are harder than negatives
@@ -727,6 +796,11 @@ class FrequencyAdapterTrainer:
                 self.logger.warning(f"Loss magnitude too large: {loss.item():.2e}, skipping batch")
                 num_skipped += 1
                 continue
+            
+            # Store gamma values for statistics
+            if len(gamma_values) > 0:
+                gamma_vals = [g.item() for g in gamma_values]
+                gamma_values_history.append(gamma_vals)
             
             # Backward pass
             self.optimizer.zero_grad()
@@ -742,17 +816,37 @@ class FrequencyAdapterTrainer:
             total_loss += loss.item()
             num_batches += 1
             
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'skipped': num_skipped})
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'gamma_reg': f"{total_loss_gamma/max(num_batches,1):.6f}",
+                'skipped': num_skipped
+            })
         
         avg_loss = total_loss / max(num_batches, 1)
+        avg_loss_gamma = total_loss_gamma / max(num_batches, 1)
+        avg_loss_mag = total_loss_mag / max(num_batches, 1)
         
         if num_skipped > 0:
             self.logger.info(f"Skipped {num_skipped} batches due to numerical issues")
         
+        # Compute gamma statistics
+        gamma_stats = {}
+        if gamma_values_history:
+            gamma_array = np.array(gamma_values_history)
+            for i in range(gamma_array.shape[1]):
+                gamma_col = gamma_array[:, i]
+                gamma_stats[f'gamma_{i}_mean'] = float(np.mean(gamma_col))
+                gamma_stats[f'gamma_{i}_std'] = float(np.std(gamma_col))
+                gamma_stats[f'gamma_{i}_max'] = float(np.max(gamma_col))
+                gamma_stats[f'gamma_{i}_min'] = float(np.min(gamma_col))
+        
         return {
             'loss': avg_loss,
+            'loss_gamma': avg_loss_gamma,
+            'loss_magnitude': avg_loss_mag,
             'num_batches': num_batches,
-            'num_skipped': num_skipped
+            'num_skipped': num_skipped,
+            'gamma_stats': gamma_stats
         }
     
     @torch.no_grad()
@@ -880,6 +974,8 @@ class FrequencyAdapterTrainer:
         max_train_samples: Optional[int] = None,
         max_val_samples: Optional[int] = None,
         use_medpix: bool = True,
+        multi_task: bool = False,
+        segmentation_val_path: Optional[str] = None,
     ):
         """
         Train frequency adapters.
@@ -893,7 +989,22 @@ class FrequencyAdapterTrainer:
             max_train_samples: Maximum training samples (for debugging)
             max_val_samples: Maximum validation samples (for debugging)
             use_medpix: Whether to use MedPix dataset (True) or medical segmentation datasets (False)
+            multi_task: Enable multi-task learning with gamma regularization (default: False)
+            segmentation_val_path: Path to segmentation validation data for spatial regularization (optional)
         """
+        # Set multi-task mode
+        self.multi_task_enabled = multi_task
+        self.use_segmentation_validation = segmentation_val_path is not None
+        
+        if multi_task:
+            self.logger.info("✓ Multi-task learning ENABLED")
+            self.logger.info(f"  - Lambda gamma: {self.lambda_gamma}")
+            self.logger.info(f"  - Lambda magnitude: {self.lambda_magnitude}")
+            self.logger.info(f"  - Lambda spatial: {self.lambda_spatial}")
+        
+        if self.use_segmentation_validation:
+            self.logger.info(f"✓ Segmentation validation ENABLED: {segmentation_val_path}")
+        
         if val_batch_size is None:
             val_batch_size = batch_size
         
@@ -1034,7 +1145,7 @@ class FrequencyAdapterTrainer:
             self.logger.info(f"\nEpoch {epoch+1}/{num_epochs}")
             
             # Train
-            train_metrics = self.train_epoch(train_loader)
+            train_metrics = self.train_epoch(train_loader, epoch=epoch+1)
             
             # Check training quality
             skip_ratio = train_metrics.get('num_skipped', 0) / max(len(train_loader), 1)

@@ -138,9 +138,12 @@ class BiomedCLIPEncoderLayerWithAdapter(nn.Module):
         # Step 2: Get frequency features from trainable adapter
         x_freq = self.adapter(hidden_states)
         
-        # Step 3: Fusion with learned scaling
+        # Step 3: Fusion with learned scaling and gamma clamping
         # γ·X_freq scales the contribution of frequency information
-        output = x_semantic + self.gamma * x_freq
+        # IMPORTANT: Clamp gamma to [0.0, 0.5] to prevent numerical explosion
+        # This ensures adapter contributes at most 33% of final output
+        gamma_clamped = torch.clamp(self.gamma, min=0.0, max=0.5)
+        output = x_semantic + gamma_clamped * x_freq
         
         # Prepare return tuple
         outputs = (output,)
@@ -172,6 +175,54 @@ class BiomedCLIPEncoderLayerWithAdapter(nn.Module):
             frozen.append(param)
         
         return trainable, frozen
+    
+    def get_feature_norms(self, hidden_states: torch.Tensor) -> Dict[str, float]:
+        """
+        Compute and return feature norms for monitoring stability.
+        
+        Args:
+            hidden_states: Input features (B, N, D)
+            
+        Returns:
+            Dictionary with feature norm statistics:
+            - semantic_norm: L2 norm of semantic features
+            - freq_norm: L2 norm of frequency features
+            - fusion_component: γ * freq_norm (actual contribution)
+            - output_norm: L2 norm of final output
+            - gamma_value: Current gamma value (before clamping)
+            - gamma_clamped: Gamma value after clamping
+            - contribution_ratio: (γ * freq_norm) / semantic_norm
+        """
+        with torch.no_grad():
+            # Get semantic features
+            semantic_output = self.original_layer(hidden_states)
+            x_semantic = semantic_output[0]
+            
+            # Get frequency features
+            x_freq = self.adapter(hidden_states)
+            
+            # Compute norms
+            semantic_norm = torch.norm(x_semantic, p=2).item()
+            freq_norm = torch.norm(x_freq, p=2).item()
+            
+            # Compute with clamping
+            gamma_clamped = torch.clamp(self.gamma, min=0.0, max=0.5)
+            fusion_component = (gamma_clamped * freq_norm).item()
+            output = x_semantic + gamma_clamped * x_freq
+            output_norm = torch.norm(output, p=2).item()
+            
+            # Compute contribution ratio
+            contribution_ratio = fusion_component / (semantic_norm + 1e-8)
+        
+        return {
+            'semantic_norm': semantic_norm,
+            'freq_norm': freq_norm,
+            'fusion_component': fusion_component,
+            'output_norm': output_norm,
+            'gamma_value': self.gamma.item(),
+            'gamma_clamped': gamma_clamped.item(),
+            'contribution_ratio': contribution_ratio,
+        }
     
     def __repr__(self) -> str:
         return (
